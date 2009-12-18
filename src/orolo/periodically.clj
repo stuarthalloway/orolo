@@ -33,11 +33,13 @@ A periodic agent's state is a map with the following keys:
    :sleep-millis             the number of milliseconds between executions of periodic-fn
    :count 0                  the number of times periodic-fn has been called
    :exception-count          the total number of exceptions that periodic-fn has thrown
-   :recent-exceptions        a vector of the most recent exceptions that have been thrown by periodic-fn
+   :recent-exceptions        list of most recent exceptions thrown by periodic-fn (newest first)
    :max-recent-exceptions    the maximum number of recent exceptions kept
    :active                   periodic-fn will only be executed by the agent while this is true
 " }
-  orolo.periodically)
+  orolo.periodically
+  (:import clojure.contrib.jmx.Bean)
+  (:require [clojure.contrib.jmx :as jmx]))
 
 ;; Todo:
 ;; - optionally execute right away (although the caller can always just call func just before calling periodically)
@@ -125,3 +127,7 @@ Returns the agent immediately."
                   (do
                     (send-off *agent* invoke-periodic-fn)
                     (assoc state :active true))))))
+
+(defn periodic-agent->jmx [agent namespace agent-name]
+  (jmx/register-mbean (jmx/Bean. agent)
+                      (str namespace ":periodic-agent=" agent-name)))

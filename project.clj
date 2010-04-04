@@ -5,4 +5,5 @@
                  [org.clojure/clojure-contrib
                   "1.2.0-SNAPSHOT"]
                  [org.clojure/swank-clojure
-                  "1.0"]])
+                  "1.0"]]
+  :namespaces [orolo.periodically])

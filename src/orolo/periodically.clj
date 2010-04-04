@@ -8,7 +8,7 @@
 
 (ns
     #^{ :author "Glenn Vanderburg"
-        :doc "Easy, manageable, agent-based periodic background execution.
+        :doc "Easy, manageable, periodic background execution.
 
 Usage
   (require 'orolo.periodically)
@@ -17,33 +17,24 @@ Starting periodic execution:
   ;; call hello every 3 seconds
   (periodically hello 3000)
 
-  ;; call heartbeat every 30 seconds, and remember the agent in *heartbeat-agent*
-  (defvar *heartbeat-agent* (periodically heartbeat (* 30 1000)))
+  ;; call heartbeat every 30 seconds, and remember the task in *heartbeat-task*
+  (defvar *heartbeat-task* (periodically heartbeat (* 30 1000)))
 
 Suspending:
-  (suspend-periodic-agent *heartbeat-agent*)
+  (suspend *heartbeat-task*)
 
 Resuming:
-  (resume-periodic-agent *heartbeat-agent*)
+  (resume *heartbeat-task*)
 
-The periodically function creates and returns a type of agent known as a 'periodic agent'.
-A periodic agent's state is a map with the following keys:
+Expose as JMX MBean:
+  (jmx *heartbeat-task* \"MyService\" \"heartbeat\")
 
-   :periodic-fn              the user-supplied function to be executed periodically
-   :sleep-millis             the number of milliseconds between executions of periodic-fn
-   :count 0                  the number of times periodic-fn has been called
-   :exception-count          the total number of exceptions that periodic-fn has thrown
-   :recent-exceptions        list of most recent exceptions thrown by periodic-fn (newest first)
-   :max-recent-exceptions    the maximum number of recent exceptions kept
-   :active                   periodic-fn will only be executed by the agent while this is true
-" }
+The periodically function creates and returns a value of the type PeriodicTask." }
   orolo.periodically
-  (:import clojure.contrib.jmx.Bean)
   (:require [clojure.contrib.jmx :as jmx]))
 
 ;; Todo:
 ;; - optionally execute right away (although the caller can always just call func just before calling periodically)
-;; - optionally register an MBean exposing state and suspend/resume operations
 ;; - add optional circuit-breaker functionality around exceptions
 ;; - add some sort of logging hooks
 
@@ -68,10 +59,13 @@ Old exceptions are dropped to keep the size of :recent-exceptions stays under :m
                   e))
      :exception-count)))
 
+(defn- update-in-task [task field value]
+  (ref-set (:state-ref task)
+           (assoc @(:state-ref task) field value)))
+
 (defn- invoke-periodic-fn
-  "Performs one execution of a periodic agent.
-Executes :periodic-fn, handles exceptions, increments :count, sleeps for :sleep-millis
-and suspends the periodic agent if required."
+  "Performs one execution of a periodic task.
+Executes :periodic-fn, handles exceptions, and increments :count."
   [state-ref]
   (dosync
    (ref-set state-ref
@@ -81,7 +75,9 @@ and suspends the periodic agent if required."
              (catch Exception e
                (inc-count (store-exception @state-ref e)))))))
 
-(defn- schedule-periodic-task [task]
+(defn- schedule-periodic-task
+  "Schedules a PeriodicTask to run on *periodic-executor*."
+  [task]
    (let [millis (:sleep-millis @(:state-ref task))
          func (:periodic-fn @(:state-ref task))]
      (.scheduleAtFixedRate (:executor task)
@@ -95,24 +91,86 @@ and suspends the periodic agent if required."
   (resume [pa])
   (jmx [pa namespace executor-name]))
 
+(definterface PeriodicTaskMXBean
+  ;; getters
+  (#^String getPeriodicFunction [])
+  (#^long getSleepMillis [])
+  (#^long getNumberOfTimesRun [])
+  (#^long getNumberOfExceptions [])
+  (#^java.util.List getRecentExceptions [])
+  (#^short getMaxNumberOfRecentExceptionsKept [])
+
+  ;; queries
+  (#^boolean isActive [])
+
+  ;; setters
+  (#^void setSleepMillis [#^long millis])
+  (#^void setMaxNumberOfRecentExceptionsKept [#^short num])
+
+  ;; operations
+  (#^void suspend [])
+  (#^void resume [])
+  (#^void clearRecentExceptions []))
+
+(deftype ScheduledFuturePeriodicTaskMXBean [task]
+
+  orolo.periodically.PeriodicTaskMXBean
+  (getPeriodicFunction []
+     (let [func (:periodic-fn @(:state-ref task))
+           func-meta (meta (:periodic-fn @(:state-ref task)))
+           ns (:ns func-meta)
+           name (:name func-meta)]
+       (cond
+        (and ns name) (str ns "/" name)
+        name name
+        true (.toString func))))
+  (getSleepMillis [] (:sleep-millis @(:state-ref task)))
+  (getNumberOfTimesRun [] (:count @(:state-ref task)))
+  (getNumberOfExceptions [] (:exception-count @(:state-ref task)))
+  (getRecentExceptions [] (map #(.toString %) (:recent-exceptions @(:state-ref task))))
+  (getMaxNumberOfRecentExceptionsKept [] (:max-recent-exceptions @(:state-ref task)))
+
+  (isActive [] (:active @(:state-ref task)))
+
+  (setSleepMillis [millis]
+     (dosync
+      (update-in-task task :sleep-millis millis)
+      (when (:active @(:state-ref task))
+        (do
+          (suspend task)
+          (resume task)))))
+  (setMaxNumberOfRecentExceptionsKept [num]
+     (dosync
+      (update-in-task task :max-recent-exceptions num)))
+
+  (suspend []
+     (when (:active @(:state-ref task))
+       (suspend task)))
+  (resume []
+     (when-not (:active @(:state-ref task))
+       (resume task)))
+  (clearRecentExceptions [] (dosync (update-in-task task :recent-exceptions '()))))
+
 (deftype ScheduledFuturePeriodicTask
   [state-ref future-ref executor]
   :as this
 
   PeriodicTask
-  (suspend [] (dosync
-               (when (:active @state-ref)
-                 (.cancel @future-ref false)
-                 (ref-set state-ref (assoc @state-ref :active false)))))
+  (suspend []
+     (dosync
+      (when (:active @state-ref)
+        (.cancel @future-ref false)
+        (ref-set state-ref (assoc @state-ref :active false)))))
 
-  (resume [] (dosync
-              (when-not (:active @state-ref)
-                (ref-set future-ref (schedule-periodic-task this))
-                (ref-set state-ref (assoc @state-ref :active true)))))
+  (resume []
+     (dosync
+      (when-not (:active @state-ref)
+        (ref-set future-ref (schedule-periodic-task this))
+        (ref-set state-ref (assoc @state-ref :active true)))))
 
   (jmx [namespace task-name]
-       (jmx/register-mbean (jmx/Bean. state-ref)
-                           (str namespace ":PeriodicTask=" task-name))))
+     (jmx/register-mbean (ScheduledFuturePeriodicTaskMXBean this)
+                         (str namespace ":PeriodicTask=" task-name))))
 
 (def *periodic-executor* (java.util.concurrent.ScheduledThreadPoolExecutor. 2))
 
@@ -128,3 +186,4 @@ and suspends the periodic agent if required."
     (dosync
      (ref-set (:future-ref task) (schedule-periodic-task task)))
     task))
+

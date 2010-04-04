@@ -68,66 +68,63 @@ Old exceptions are dropped to keep the size of :recent-exceptions stays under :m
                   e))
      :exception-count)))
 
-(declare sleep-periodic-agent invoke-periodic-fn)
-
-(defn- sleep-periodic-agent
-  "Sleeps the periodic agent for :sleep-millis and then sends off invoke-periodic-fn."
-  [state]
-  (if (:active state)
-    (do
-      (Thread/sleep (:sleep-millis state))
-      (send-off *agent* invoke-periodic-fn)))
-  state)
-
 (defn- invoke-periodic-fn
   "Performs one execution of a periodic agent.
 Executes :periodic-fn, handles exceptions, increments :count, sleeps for :sleep-millis
 and suspends the periodic agent if required."
-  [state]
-  (if (:active state)
-    (try
-     ((:periodic-fn state))
-     (inc-count state)
-     (catch Exception e
-       (inc-count (store-exception state e)))
-     (finally
-      (send-off *agent* sleep-periodic-agent)))
-    state))
+  [state-ref]
+  (dosync
+   (ref-set state-ref
+            (try
+             ((:periodic-fn @state-ref))
+             (inc-count @state-ref)
+             (catch Exception e
+               (inc-count (store-exception @state-ref e)))))))
 
-(defn- periodic-agent
-  "Creates a new periodic agent with its state initialized to an appropriate map."
-  [func millis]
-  (agent { :periodic-fn func          ; configurable
-           :sleep-millis millis       ; configurable
-           :count 0                   ; potential for overflow?
-           :exception-count 0         ; potential for overflow?
-           :recent-exceptions '()
-           :max-recent-exceptions 10  ; should this be configurable?
-           :active true               ; indirectly configurable
-         }))
+(defn- schedule-periodic-task [task]
+   (let [millis (:sleep-millis @(:state-ref task))
+         func (:periodic-fn @(:state-ref task))]
+     (.scheduleAtFixedRate (:executor task)
+                           (partial invoke-periodic-fn (:state-ref task))
+                           millis
+                           millis
+                           java.util.concurrent.TimeUnit/MILLISECONDS)))
 
-(defn periodically
-  "Runs func every millis milliseconds using a periodic agent.
-Returns the agent immediately."
-  [func millis]
-  (send-off (periodic-agent func millis) sleep-periodic-agent))
+(defprotocol PeriodicTask
+  (suspend [pa])
+  (resume [pa])
+  (jmx [pa namespace executor-name]))
 
-(defn suspend-periodic-agent
-  "Suspends the repeated execution of a periodic agent."
-  [agent]
-  (send agent (fn [state]
-                (assoc state :active false))))
+(deftype ScheduledFuturePeriodicTask
+  [state-ref future-ref executor]
+  :as this
 
-(defn resume-periodic-agent
-  "Resumes the repeated execution of a suspended periodic agent."
-  [agent]
-  (send agent (fn [state]
-                (if (:active state)
-                  state
-                  (do
-                    (send-off *agent* invoke-periodic-fn)
-                    (assoc state :active true))))))
+  PeriodicTask
+  (suspend [] (dosync
+               (when (:active @state-ref)
+                 (.cancel @future-ref false)
+                 (ref-set state-ref (assoc @state-ref :active false)))))
 
-(defn periodic-agent->jmx [agent namespace agent-name]
-  (jmx/register-mbean (jmx/Bean. agent)
-                      (str namespace ":periodic-agent=" agent-name)))
+  (resume [] (dosync
+              (when-not (:active @state-ref)
+                (ref-set future-ref (schedule-periodic-task this))
+                (ref-set state-ref (assoc @state-ref :active true)))))
+
+  (jmx [namespace task-name]
+       (jmx/register-mbean (jmx/Bean. state-ref)
+                           (str namespace ":PeriodicTask=" task-name))))
+
+(def *periodic-executor* (java.util.concurrent.ScheduledThreadPoolExecutor. 2))
+
+(defn periodically [func millis]
+  (let [state-ref (ref { :periodic-fn           func
+                         :sleep-millis          millis
+                         :count                 0
+                         :exception-count       0
+                         :recent-exceptions     `()
+                         :max-recent-exceptions 10
+                         :active                true })
+        task (ScheduledFuturePeriodicTask state-ref (ref nil) *periodic-executor*)]
+    (dosync
+     (ref-set (:future-ref task) (schedule-periodic-task task)))
+    task))

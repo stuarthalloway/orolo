@@ -42,12 +42,12 @@ The periodically function creates and returns a value of the type PeriodicTask."
   (assoc coll key (inc (key coll))))
 
 (defn- inc-count
-  "Increments the value of :count in the state of a periodic agent."
+  "Increments the value of :count in the state of a PeriodicTask."
   [state]
   (inc-in state :count))
 
 (defn- store-exception
-  "Stores e in :recent-exceptions in the state of a periodic agent.
+  "Stores e in :recent-exceptions in the state of a PeriodicTask.
 Old exceptions are dropped to keep the size of :recent-exceptions stays under :max-recent-exceptions."
   [state e]
   (let [exception-queue (:recent-exceptions state)]
@@ -59,12 +59,13 @@ Old exceptions are dropped to keep the size of :recent-exceptions stays under :m
                   e))
      :exception-count)))
 
-(defn- update-in-task [task field value]
+(defn- update-in-task [task field new-value]
+  "Updates a field in the state-ref of a PeriodicTask."
   (ref-set (:state-ref task)
-           (assoc @(:state-ref task) field value)))
+           (assoc @(:state-ref task) field new-value)))
 
 (defn- invoke-periodic-fn
-  "Performs one execution of a periodic task.
+  "Performs one execution of a PeriodicTask.
 Executes :periodic-fn, handles exceptions, and increments :count."
   [state-ref]
   (dosync
@@ -87,25 +88,26 @@ Executes :periodic-fn, handles exceptions, and increments :count."
                            java.util.concurrent.TimeUnit/MILLISECONDS)))
 
 (defprotocol PeriodicTask
+  "A function scheduled to run periodically."
   (suspend [pa])
   (resume [pa])
   (jmx [pa namespace executor-name]))
 
 (definterface PeriodicTaskMXBean
   ;; getters
-  (#^String getPeriodicFunction [])
-  (#^long getSleepMillis [])
-  (#^long getNumberOfTimesRun [])
-  (#^long getNumberOfExceptions [])
+  (#^short          getMaxNumberOfRecentExceptionsKept [])
+  (#^long           getNumberOfExceptions [])
+  (#^long           getNumberOfTimesRun [])
+  (#^String         getPeriodicFunction [])
   (#^java.util.List getRecentExceptions [])
-  (#^short getMaxNumberOfRecentExceptionsKept [])
+  (#^long           getSleepMillis [])
 
   ;; queries
   (#^boolean isActive [])
 
   ;; setters
-  (#^void setSleepMillis [#^long millis])
   (#^void setMaxNumberOfRecentExceptionsKept [#^short num])
+  (#^void setSleepMillis [#^long millis])
 
   ;; operations
   (#^void suspend [])
@@ -115,6 +117,9 @@ Executes :periodic-fn, handles exceptions, and increments :count."
 (deftype ScheduledFuturePeriodicTaskMXBean [task]
 
   orolo.periodically.PeriodicTaskMXBean
+  (getMaxNumberOfRecentExceptionsKept [] (:max-recent-exceptions @(:state-ref task)))
+  (getNumberOfExceptions [] (:exception-count @(:state-ref task)))
+  (getNumberOfTimesRun [] (:count @(:state-ref task)))
   (getPeriodicFunction []
      (let [func (:periodic-fn @(:state-ref task))
            func-meta (meta (:periodic-fn @(:state-ref task)))
@@ -124,14 +129,14 @@ Executes :periodic-fn, handles exceptions, and increments :count."
         (and ns name) (str ns "/" name)
         name name
         true (.toString func))))
-  (getSleepMillis [] (:sleep-millis @(:state-ref task)))
-  (getNumberOfTimesRun [] (:count @(:state-ref task)))
-  (getNumberOfExceptions [] (:exception-count @(:state-ref task)))
   (getRecentExceptions [] (map #(.toString %) (:recent-exceptions @(:state-ref task))))
-  (getMaxNumberOfRecentExceptionsKept [] (:max-recent-exceptions @(:state-ref task)))
+  (getSleepMillis [] (:sleep-millis @(:state-ref task)))
 
   (isActive [] (:active @(:state-ref task)))
 
+  (setMaxNumberOfRecentExceptionsKept [num]
+     (dosync
+      (update-in-task task :max-recent-exceptions num)))
   (setSleepMillis [millis]
      (dosync
       (update-in-task task :sleep-millis millis)
@@ -139,9 +144,6 @@ Executes :periodic-fn, handles exceptions, and increments :count."
         (do
           (suspend task)
           (resume task)))))
-  (setMaxNumberOfRecentExceptionsKept [num]
-     (dosync
-      (update-in-task task :max-recent-exceptions num)))
 
   (suspend []
      (when (:active @(:state-ref task))
@@ -174,16 +176,16 @@ Executes :periodic-fn, handles exceptions, and increments :count."
 
 (def *periodic-executor* (java.util.concurrent.ScheduledThreadPoolExecutor. 2))
 
-(defn periodically [func millis]
-  (let [state-ref (ref { :periodic-fn           func
-                         :sleep-millis          millis
+(defn periodically
+  [func millis]
+  (let [state-ref (ref { :active                true
                          :count                 0
                          :exception-count       0
-                         :recent-exceptions     `()
                          :max-recent-exceptions 10
-                         :active                true })
+                         :periodic-fn           func
+                         :recent-exceptions     `()
+                         :sleep-millis          millis })
         task (ScheduledFuturePeriodicTask state-ref (ref nil) *periodic-executor*)]
     (dosync
      (ref-set (:future-ref task) (schedule-periodic-task task)))
     task))
-
